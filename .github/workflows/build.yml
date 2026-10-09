@@ -40,16 +40,29 @@ jobs:
            [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ] || \
            [ -z "${ANDROID_KEY_ALIAS:-}" ] || \
            [ -z "${ANDROID_KEY_PASSWORD:-}" ]; then
-          echo "Signing secrets are not configured; keeping unsigned artifact only."
-          echo "signed=false" >> "$GITHUB_OUTPUT"
-          exit 0
+          echo "::warning::No persistent signing secrets; generating a one-time test signing key. This APK cannot update an existing installation signed with another key."
+          TEMP_SIGNING=true
+          ANDROID_KEYSTORE_PASSWORD="$(openssl rand -hex 24)"
+          ANDROID_KEY_PASSWORD="$ANDROID_KEYSTORE_PASSWORD"
+          ANDROID_KEY_ALIAS="temporary-ci-test-key"
+        else
+          TEMP_SIGNING=false
         fi
 
         KEYSTORE="$RUNNER_TEMP/release-signing.jks"
         SIGNED_APK="app/build/outputs/apk/release/RootScriptLauncher-release-signed.apk"
         UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
 
-        printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+        if [ "$TEMP_SIGNING" = "true" ]; then
+          keytool -genkeypair -noprompt -keystore "$KEYSTORE" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -keypass "$ANDROID_KEY_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" \
+            -keyalg RSA -keysize 3072 -validity 365 \
+            -dname "CN=RootScriptLauncher Temporary CI Test"
+        else
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+        fi
 
         APKSIGNER="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
         if [ -z "$APKSIGNER" ]; then
@@ -68,6 +81,7 @@ jobs:
         "$APKSIGNER" verify --verbose --print-certs "$SIGNED_APK"
         rm -f "$KEYSTORE"
         echo "signed=true" >> "$GITHUB_OUTPUT"
+        echo "temporary_signing=$TEMP_SIGNING" >> "$GITHUB_OUTPUT"
 
     - name: Upload signed APK artifact
       if: steps.sign_release.outputs.signed == 'true'
@@ -105,8 +119,11 @@ jobs:
           "- Legacy bundled-script entries are cleaned up after upgrade." \
           "" \
           "Files:" \
-          "- Signed APK is published here only when repository signing secrets are configured." \
-          "- Unsigned APK is available only as a GitHub Actions artifact and is not installable.")"
+          "- Installable signed APK is attached to this release." \
+          "- If the file name contains CI-Temporary-Signed, it uses a one-time CI test key." \
+          "- Temporary-signed builds CANNOT update an APK signed by another key; uninstall the old app first (back up imported scripts)." \
+          "- For regular upgrades configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD as repository secrets." \
+          "- Unsigned APK is a GitHub Actions artifact and is not installable.")"
 
         if gh release view "$TAG" >/dev/null 2>&1; then
           gh release edit "$TAG" --title "RootScriptLauncher $TAG" --notes "$NOTES"
@@ -118,7 +135,11 @@ jobs:
 
         SIGNED_SRC="app/build/outputs/apk/release/RootScriptLauncher-release-signed.apk"
         if [ -f "$SIGNED_SRC" ]; then
-          SIGNED_DST="$RUNNER_TEMP/RootScriptLauncher-$TAG-Release-Signed.apk"
+          if [ "${{ steps.sign_release.outputs.temporary_signing }}" = "true" ]; then
+            SIGNED_DST="$RUNNER_TEMP/RootScriptLauncher-$TAG-CI-Temporary-Signed.apk"
+          else
+            SIGNED_DST="$RUNNER_TEMP/RootScriptLauncher-$TAG-Release-Signed.apk"
+          fi
           cp "$SIGNED_SRC" "$SIGNED_DST"
           gh release upload "$TAG" "$SIGNED_DST" --clobber
         fi
